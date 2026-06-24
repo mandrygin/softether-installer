@@ -11,54 +11,53 @@ ENABLE_OPENVPN="${ENABLE_OPENVPN:-yes}"
 FORCE="${FORCE:-no}"
 
 if [[ "$EUID" -ne 0 ]]; then
-echo "Запусти от root:"
-echo "  curl -fsSL URL | bash"
+echo "Запусти от root"
 exit 1
 fi
 
 echo "=== SoftEther VPN installer ==="
 
+gen_pass() {
+openssl rand -hex 12
+}
+
 install_docker() {
+echo "[1/6] Проверка Docker..."
+
+apt-get update
+apt-get install -y ca-certificates curl gnupg openssl
+
 if command -v docker >/dev/null 2>&1; then
 systemctl enable --now docker || true
 return
 fi
 
-echo "[1/6] Установка Docker..."
-
-apt-get update
-apt-get install -y ca-certificates curl gnupg openssl
+echo "Docker не найден, ставлю..."
 
 install -m 0755 -d /etc/apt/keyrings
 
-if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg 
-| gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg
+gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
-fi
 
 UBUNTU_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
 
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable" 
+printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu %s stable\n' 
+"$(dpkg --print-architecture)" 
+"$UBUNTU_CODENAME" 
 > /etc/apt/sources.list.d/docker.list
 
 apt-get update
 
 if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
-echo "Не удалось поставить docker-ce, пробую docker.io..."
+echo "docker-ce не поставился, пробую docker.io..."
 apt-get install -y docker.io
 fi
 
 systemctl enable --now docker
 }
 
-gen_pass() {
-openssl rand -hex 12
-}
-
 install_docker
-
-apt-get install -y curl openssl ca-certificates
 
 ADMIN_PASS="${ADMIN_PASS:-$(gen_pass)}"
 HUB_PASS="${HUB_PASS:-$(gen_pass)}"
@@ -66,7 +65,7 @@ VPN_PASS="${VPN_PASS:-$(gen_pass)}"
 IPSEC_PSK="${IPSEC_PSK:-$(gen_pass)}"
 
 if [[ "$SOFTETHER_TAG" != "stable" && "$ENABLE_L2TP" == "yes" ]]; then
-echo "ВНИМАНИЕ: для SOFTETHER_TAG=${SOFTETHER_TAG} L2TP будет отключён."
+echo "Для версии ${SOFTETHER_TAG} L2TP отключён."
 ENABLE_L2TP="no"
 fi
 
@@ -76,48 +75,46 @@ echo "[2/6] Проверка старого контейнера..."
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
 if [[ "$FORCE" == "yes" ]]; then
-echo "Удаляю старый контейнер..."
 docker rm -f "$CONTAINER_NAME" || true
 else
 echo "Контейнер $CONTAINER_NAME уже существует."
-echo "Для полной переустановки:"
-echo "  FORCE=yes curl -fsSL URL | bash"
+echo "Для переустановки:"
+echo "FORCE=yes curl -fsSL URL | bash"
 exit 1
 fi
 fi
 
-echo "[3/6] Запуск SoftEther контейнера..."
-
-PORTS=(
--p 443:443/tcp
--p 992:992/tcp
--p 5555:5555/tcp
-)
-
-if [[ "$ENABLE_OPENVPN" == "yes" ]]; then
-PORTS+=(-p 1194:1194/udp)
-fi
-
-if [[ "$ENABLE_L2TP" == "yes" ]]; then
-PORTS+=(
--p 500:500/udp
--p 4500:4500/udp
--p 1701:1701/udp
-)
-fi
+echo "[3/6] Запуск SoftEther..."
 
 docker volume create softetherdata >/dev/null
 
-docker run -d 
---name "$CONTAINER_NAME" 
---hostname "$CONTAINER_NAME" 
---cap-add NET_ADMIN 
---restart unless-stopped 
-"${PORTS[@]}" 
--v softetherdata:/mnt 
-"softethervpn/vpnserver:${SOFTETHER_TAG}"
+RUN_ARGS=(
+-d
+--name "$CONTAINER_NAME"
+--hostname "$CONTAINER_NAME"
+--cap-add NET_ADMIN
+--restart unless-stopped
+-p 443:443/tcp
+-p 992:992/tcp
+-p 5555:5555/tcp
+-v softetherdata:/mnt
+)
 
-echo "[4/6] Ожидание запуска vpncmd..."
+if [[ "$ENABLE_OPENVPN" == "yes" ]]; then
+RUN_ARGS+=(-p 1194:1194/udp)
+fi
+
+if [[ "$ENABLE_L2TP" == "yes" ]]; then
+RUN_ARGS+=(-p 500:500/udp)
+RUN_ARGS+=(-p 4500:4500/udp)
+RUN_ARGS+=(-p 1701:1701/udp)
+fi
+
+RUN_ARGS+=("softethervpn/vpnserver:${SOFTETHER_TAG}")
+
+docker run "${RUN_ARGS[@]}"
+
+echo "[4/6] Ожидание запуска..."
 
 for i in {1..30}; do
 if docker exec "$CONTAINER_NAME" vpncmd /TOOLS /CMD About >/dev/null 2>&1; then
@@ -126,7 +123,6 @@ fi
 
 if [[ "$i" == "30" ]]; then
 echo "SoftEther не запустился."
-echo "Логи:"
 docker logs "$CONTAINER_NAME"
 exit 1
 fi
@@ -166,7 +162,7 @@ IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:${IPSEC_PSK} /DEFAULTHUB:${HU
 EOF
 fi
 
-echo "[6/6] Сохранение данных доступа..."
+echo "[6/6] Сохранение данных..."
 
 PUBLIC_IP="$(curl -4 -fsS https://api.ipify.org || hostname -I | awk '{print $1}')"
 
