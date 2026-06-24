@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -13,22 +13,74 @@ ENABLE_L2TP="${ENABLE_L2TP:-yes}"
 ENABLE_OPENVPN="${ENABLE_OPENVPN:-yes}"
 FORCE="${FORCE:-no}"
 
-if [ "$(id -u)" -ne 0 ]; then
-echo "Ошибка: запусти от root"
+fail() {
+echo
+echo "ОШИБКА: $1"
+echo
+if command -v docker >/dev/null 2>&1; then
+docker ps -a --filter "name=${CONTAINER_NAME}" || true
+docker logs --tail 80 "${CONTAINER_NAME}" 2>/dev/null || true
+fi
 exit 1
+}
+
+on_error() {
+echo
+echo "Скрипт остановился на строке: $1"
+if command -v docker >/dev/null 2>&1; then
+docker logs --tail 80 "${CONTAINER_NAME}" 2>/dev/null || true
+fi
+}
+
+trap 'on_error $LINENO' ERR
+
+if [ "$(id -u)" -ne 0 ]; then
+fail "запусти от root"
 fi
 
 echo "=== SoftEther VPN installer ==="
 
-echo "[1/6] Установка Docker и зависимостей..."
+case "$SOFTETHER_TAG" in
+stable|5.2.5188) ;;
+*) fail "SOFTETHER_TAG должен быть stable или 5.2.5188" ;;
+esac
+
+case "$ENABLE_L2TP" in
+yes|no) ;;
+*) fail "ENABLE_L2TP должен быть yes или no" ;;
+esac
+
+case "$ENABLE_OPENVPN" in
+yes|no) ;;
+*) fail "ENABLE_OPENVPN должен быть yes или no" ;;
+esac
+
+echo "[1/6] Подготовка Ubuntu и установка Docker..."
 
 rm -f /etc/apt/sources.list.d/docker.list
 rm -f /etc/apt/keyrings/docker.gpg
+rm -f /tmp/docker.gpg
 
 apt-get update
-apt-get install -y docker.io curl openssl ca-certificates
+apt-get install -y ca-certificates curl openssl lsb-release software-properties-common
+
+if ! apt-cache policy docker.io | grep -q "Candidate:"; then
+add-apt-repository -y universe || true
+apt-get update
+fi
+
+if apt-cache policy docker.io | grep -q "Candidate: (none)"; then
+add-apt-repository -y universe || true
+apt-get update
+fi
+
+apt-get install -y docker.io
 
 systemctl enable --now docker
+
+if ! docker version >/dev/null 2>&1; then
+fail "Docker установлен, но не запускается"
+fi
 
 ADMIN_PASS="$(openssl rand -hex 12)"
 HUB_PASS="$(openssl rand -hex 12)"
@@ -36,21 +88,23 @@ VPN_PASS="$(openssl rand -hex 12)"
 IPSEC_PSK="$(openssl rand -hex 12)"
 
 if [ "$SOFTETHER_TAG" != "stable" ] && [ "$ENABLE_L2TP" = "yes" ]; then
-echo "Для версии $SOFTETHER_TAG L2TP отключён."
+echo "Для версии ${SOFTETHER_TAG} L2TP отключён. Для L2TP используй stable."
 ENABLE_L2TP="no"
 fi
 
 mkdir -p "$INSTALL_DIR"
 
-echo "[2/6] Проверка старого контейнера..."
+echo "[2/6] Проверка старой установки..."
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
 if [ "$FORCE" = "yes" ]; then
+echo "Удаляю старый контейнер..."
 docker rm -f "$CONTAINER_NAME" || true
+docker volume rm softetherdata 2>/dev/null || true
 else
-echo "Контейнер $CONTAINER_NAME уже существует."
+echo "Контейнер ${CONTAINER_NAME} уже существует."
 echo "Для переустановки запусти:"
-echo "curl -fsSL URL | FORCE=yes bash"
+echo "curl -fsSL RAW_URL | FORCE=yes bash"
 exit 1
 fi
 fi
@@ -69,44 +123,42 @@ if [ "$ENABLE_L2TP" = "yes" ]; then
 DOCKER_PORTS="$DOCKER_PORTS -p 500:500/udp -p 4500:4500/udp -p 1701:1701/udp"
 fi
 
-docker run -d 
---name "$CONTAINER_NAME" 
---hostname "$CONTAINER_NAME" 
---cap-add NET_ADMIN 
---restart unless-stopped 
-$DOCKER_PORTS 
--v softetherdata:/mnt 
-"softethervpn/vpnserver:$SOFTETHER_TAG"
+docker run -d --name "$CONTAINER_NAME" --hostname "$CONTAINER_NAME" --cap-add NET_ADMIN --restart unless-stopped $DOCKER_PORTS -v softetherdata:/mnt "softethervpn/vpnserver:$SOFTETHER_TAG"
 
-echo "[4/6] Ожидание запуска..."
+echo "[4/6] Ожидание запуска SoftEther..."
 
-sleep 15
+READY="no"
+
+for i in $(seq 1 60); do
+if docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /CMD ServerInfoGet >/dev/null 2>&1; then
+READY="yes"
+break
+fi
+sleep 2
+done
+
+if [ "$READY" != "yes" ]; then
+fail "SoftEther не запустился"
+fi
 
 echo "[5/6] Настройка SoftEther..."
 
-printf "%s\n%s\n" "$ADMIN_PASS" "$ADMIN_PASS" | docker exec -i "$CONTAINER_NAME" 
-vpncmd localhost /SERVER /CMD ServerPasswordSet
+printf "%s\n%s\n" "$ADMIN_PASS" "$ADMIN_PASS" | docker exec -i "$CONTAINER_NAME" vpncmd localhost /SERVER /CMD ServerPasswordSet
 
-docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" 
-/CMD HubCreate "$HUB" /PASSWORD:"$HUB_PASS"
+docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD HubCreate "$HUB" /PASSWORD:"$HUB_PASS"
 
-docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB" 
-/CMD UserCreate "$VPN_USER" /GROUP:none /REALNAME:none /NOTE:none
+docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB" /CMD UserCreate "$VPN_USER" /GROUP:none /REALNAME:none /NOTE:none
 
-docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB" 
-/CMD UserPasswordSet "$VPN_USER" /PASSWORD:"$VPN_PASS"
+docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB" /CMD UserPasswordSet "$VPN_USER" /PASSWORD:"$VPN_PASS"
 
-docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB" 
-/CMD SecureNatEnable
+docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /HUB:"$HUB" /CMD SecureNatEnable
 
 if [ "$ENABLE_OPENVPN" = "yes" ]; then
-docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" 
-/CMD OpenVpnEnable yes /PORTS:1194
+docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD OpenVpnEnable yes /PORTS:1194
 fi
 
 if [ "$ENABLE_L2TP" = "yes" ]; then
-docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" 
-/CMD IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:"$IPSEC_PSK" /DEFAULTHUB:"$HUB"
+docker exec "$CONTAINER_NAME" vpncmd localhost /SERVER /PASSWORD:"$ADMIN_PASS" /CMD IPsecEnable /L2TP:yes /L2TPRAW:no /ETHERIP:no /PSK:"$IPSEC_PSK" /DEFAULTHUB:"$HUB"
 fi
 
 echo "[6/6] Сохранение данных..."
